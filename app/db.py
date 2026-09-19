@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS fork_requests (
     PRIMARY KEY (source_session_id, request_id)
 );
 
+-- 跨会话公平调度游标：每个 queue_key 记录最近一次成功发放的会话；
+-- 仅在成功领取后更新，无可发放项时保持不变
+CREATE TABLE IF NOT EXISTS dispatch_cursors (
+    queue_key        TEXT PRIMARY KEY,
+    last_session_id  TEXT NOT NULL,                       -- 最近一次成功发放的会话 id
+    updated_at       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS chunks (
     session_id        TEXT NOT NULL REFERENCES sessions(id),
     chunk_index       INTEGER NOT NULL,
@@ -125,6 +133,18 @@ CREATE TABLE fork_requests (
     reuse_chunks       TEXT NOT NULL,
     created_at         TEXT NOT NULL,
     PRIMARY KEY (source_session_id, request_id)
+)
+        """,
+    ),
+    # 0007: 跨会话公平调度游标表；旧库直接按当前定义新建，首次调度时惰性写入游标
+    (
+        "table",
+        "dispatch_cursors",
+        """
+CREATE TABLE dispatch_cursors (
+    queue_key        TEXT PRIMARY KEY,
+    last_session_id  TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
 )
         """,
     ),

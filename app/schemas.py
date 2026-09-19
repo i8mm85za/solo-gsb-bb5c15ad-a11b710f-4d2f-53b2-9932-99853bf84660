@@ -199,6 +199,94 @@ class BatchLeaseResponse(BaseModel):
         default=None, description="当前剩余并发槽位；不限并发时为 null")
 
 
+# 跨会话调度中单个候选会话不可发放的原因：
+# - session_not_found：会话不存在
+# - session_finalized：会话已提交（只读，不再发放租约）
+# - session_full：存在可领取资格的分片，但会话当前有效租约数已达 max_active_leases
+# - chunks_blocked_by_dependencies：仍有未完成分片，但全部被未完成的前置依赖阻塞
+# - chunks_in_backoff：仍有未完成、前置已完成的分片，但全部处于失败退避冷却中
+# - chunks_leased：仍有未完成、前置已完成、未在冷却中的分片，但全部持有有效租约
+# - no_unfinished_chunks：全部分片已完成（无活可干）
+DISPATCH_REASON_SESSION_NOT_FOUND = "session_not_found"
+DISPATCH_REASON_SESSION_FINALIZED = "session_finalized"
+DISPATCH_REASON_SESSION_FULL = "session_full"
+DISPATCH_REASON_BLOCKED = "chunks_blocked_by_dependencies"
+DISPATCH_REASON_BACKOFF = "chunks_in_backoff"
+DISPATCH_REASON_LEASED = "chunks_leased"
+DISPATCH_REASON_DONE = "no_unfinished_chunks"
+
+
+class DispatchLeaseRequest(BaseModel):
+    queue_key: str = Field(
+        min_length=1, max_length=128,
+        description="调度队列标识：服务端按该键持久化最近一次成功发放的会话作为轮转游标")
+    session_ids: list[str] = Field(
+        min_length=1, max_length=1000,
+        description="候选会话 id 列表：服务端去重后按（创建时间, id）稳定排序后参与轮转")
+    lease_ttl_seconds: Optional[int] = Field(
+        default=None, ge=1,
+        description="发放租约的有效期（秒），缺省取服务端默认值，超过服务端上限会被截断")
+
+    @model_validator(mode="after")
+    def _validate_session_ids(self):
+        if any(not isinstance(sid, str) or not sid.strip() for sid in self.session_ids):
+            raise ValueError("session_ids entries must be non-empty strings")
+        if any(len(sid) > 128 for sid in self.session_ids):
+            raise ValueError("session_ids entries must be at most 128 characters")
+        return self
+
+
+class DispatchGrant(BaseModel):
+    session_id: str = Field(description="实际发放租约的会话 id")
+    chunk_index: int = Field(description="领取到的分片序号：该会话内序号最低的可领取分片")
+    lease_token: str
+    expires_at: datetime
+
+
+class DispatchUnavailableSession(BaseModel):
+    session_id: Optional[str] = Field(
+        default=None,
+        description="不可发放的候选会话 id；候选中存在无法识别的空值时可能为 null")
+    reason: str = Field(
+        description="不可发放原因：session_not_found / session_finalized / session_full /"
+                    " chunks_blocked_by_dependencies / chunks_in_backoff / chunks_leased /"
+                    " no_unfinished_chunks")
+    detail: Optional[str] = Field(
+        default=None, description="原因的可读说明")
+    next_retry_at: Optional[datetime] = Field(
+        default=None,
+        description="该会话最早可能恢复可发放的时刻：取有效租约最早过期时间与退避冷却"
+                    "最早结束时间中更早者；不存在等待事件（会话不存在/已提交/全部完成/"
+                    "仅被依赖阻塞且无租约无冷却）时为 null")
+    blocked: Optional[int] = Field(
+        default=None,
+        description="未完成且被未完成前置阻塞的分片数（仅 chunks_blocked_by_dependencies 时给出）")
+    active_leases: Optional[int] = Field(
+        default=None,
+        description="会话当前有效（未过期）租约数（session_full 时给出）")
+    max_active_leases: Optional[int] = Field(
+        default=None,
+        description="会话级并发租约上限（session_full 时给出）")
+
+
+class DispatchLeaseResponse(BaseModel):
+    queue_key: str
+    granted: Optional[DispatchGrant] = Field(
+        default=None,
+        description="本次发放的租约；无可发放项时为 null")
+    cursor_session_id: Optional[str] = Field(
+        default=None,
+        description="本次请求结束后的游标会话 id（成功发放后更新为被发放会话；无可发放项时"
+                    "保持为请求前的游标）；该 queue_key 从未成功发放过时为 null")
+    unavailable: list[DispatchUnavailableSession] = Field(
+        default_factory=list,
+        description="无可发放项时，各候选会话的不可发放原因（按扫描顺序）；成功发放时为空列表")
+    next_retry_at: Optional[datetime] = Field(
+        default=None,
+        description="无可发放项时全部候选会话中最早的可重试时刻；成功发放或无任何"
+                    "等待事件时为 null")
+
+
 class CompleteRequest(BaseModel):
     lease_token: str = Field(min_length=1, max_length=128, description="当前有效租约令牌")
     chunk_digest: str = Field(
