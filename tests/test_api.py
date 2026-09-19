@@ -1799,3 +1799,283 @@ def test_migration_adds_source_session_id_column_to_legacy_database(tmp_path):
     assert "fork_requests" in tables
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- 跨会话公平调度（dispatch/lease）
+
+def dispatch(queue_key, session_ids, ttl=None):
+    body = {"queue_key": queue_key, "session_ids": session_ids}
+    if ttl is not None:
+        body["lease_ttl_seconds"] = ttl
+    return client.post("/dispatch/lease", json=body)
+
+
+def dispatch_cursor(queue_key):
+    return get_conn().execute(
+        "SELECT last_session_id FROM dispatch_cursors WHERE queue_key = ?",
+        (queue_key,),
+    ).fetchone()
+
+
+def test_dispatch_rotates_round_robin_and_never_advances_cursor_on_failure():
+    s1 = make_session(total_chunks=2)
+    s2 = make_session(total_chunks=2)
+    q = "q-rotate"
+
+    # 无游标：从稳定排序后的首个会话（先创建者）开始，领取其最低序号分片
+    r1 = dispatch(q, [s1["id"], s2["id"]]).json()
+    assert r1["granted"] is True
+    assert r1["session_id"] == s1["id"]
+    assert r1["chunk_index"] == 0
+    assert r1["lease_token"]
+    assert r1["unavailable"] == []
+    assert r1["next_retry_at"] is None
+    assert dispatch_cursor(q)["last_session_id"] == s1["id"]
+
+    # 成功后才推进游标：下一次从 s1 之后开始，轮到 s2
+    r2 = dispatch(q, [s1["id"], s2["id"]]).json()
+    assert r2["session_id"] == s2["id"]
+    assert r2["chunk_index"] == 0
+
+    # 轮转回 s1：跳过已出租的 0 号分片，领取当前最低可领取序号 1
+    r3 = dispatch(q, [s1["id"], s2["id"]]).json()
+    assert r3["session_id"] == s1["id"]
+    assert r3["chunk_index"] == 1
+
+    r4 = dispatch(q, [s1["id"], s2["id"]]).json()
+    assert r4["session_id"] == s2["id"]
+    assert r4["chunk_index"] == 1
+    tokens = {r["lease_token"] for r in (r1, r2, r3, r4)}
+    assert len(tokens) == 4  # 每次发放令牌各自不同
+    assert dispatch_cursor(q)["last_session_id"] == s2["id"]
+
+    # 全部分片租出：无可发放项，逐会话给出原因，游标不推进
+    r5 = dispatch(q, [s1["id"], s2["id"]]).json()
+    assert r5["granted"] is False
+    assert r5["session_id"] is None
+    assert [u["session_id"] for u in r5["unavailable"]] == [s1["id"], s2["id"]]
+    assert all(u["reason"] == "leases_active" for u in r5["unavailable"])
+    assert r5["next_retry_at"] is not None
+    assert dispatch_cursor(q)["last_session_id"] == s2["id"]
+
+    # 释放 s1 的 0 号分片：从游标 s2 之后循环扫描，绕回 s1 发放
+    expire_lease(s1["id"], 0)
+    r6 = dispatch(q, [s1["id"], s2["id"]]).json()
+    assert r6["granted"] is True
+    assert r6["session_id"] == s1["id"]
+    assert r6["chunk_index"] == 0
+
+
+def test_dispatch_sorts_candidates_by_created_at_and_dedupes():
+    s_old = make_session(total_chunks=1)
+    s_new = make_session(total_chunks=1)
+    # 输入乱序且含重复：去重后按（创建时间, id）稳定排序，首个可发放的是先创建的会话
+    r = dispatch("q-sort", [s_new["id"], s_old["id"], s_new["id"], s_old["id"]]).json()
+    assert r["granted"] is True
+    assert r["session_id"] == s_old["id"]
+
+
+def test_dispatch_unknown_sessions_sorted_last_and_reported_not_found():
+    s = make_session(total_chunks=1)
+    lease(s["id"], 0)  # 唯一分片租出，会话不可发放
+    body = dispatch("q-unknown", ["zzz-missing", s["id"], "aaa-missing", "zzz-missing"]).json()
+    assert body["granted"] is False
+    # 已知会话按创建时间排前；未知会话按 id 排后；重复 id 只出现一次
+    assert [u["session_id"] for u in body["unavailable"]] == [
+        s["id"], "aaa-missing", "zzz-missing"]
+    known, unk_a, unk_z = body["unavailable"]
+    assert known["reason"] == "leases_active"
+    assert known["next_retry_at"] is not None
+    assert unk_a["reason"] == "not_found" and unk_a["next_retry_at"] is None
+    assert unk_z["reason"] == "not_found" and unk_z["next_retry_at"] is None
+    # 最早可重试时刻来自唯一有时间性事件的会话（其租约过期时间）
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert body["next_retry_at"] == st["chunks"][0]["lease_expires_at"]
+
+
+def test_dispatch_reports_per_session_unavailable_reasons():
+    # finalized：已提交会话
+    s_fin = make_session(total_chunks=1)
+    t = lease(s_fin["id"], 0).json()["lease_token"]
+    assert complete(s_fin["id"], 0, t, "0" * 64).status_code == 200
+    assert client.post(f"/sessions/{s_fin['id']}/finalize").status_code == 200
+
+    # completed：分片全部完成但未提交
+    s_done = make_session(total_chunks=1)
+    t = lease(s_done["id"], 0).json()["lease_token"]
+    assert complete(s_done["id"], 0, t, "0" * 64).status_code == 200
+
+    # max_active_leases_reached：槽位占满且仍有可领取分片
+    s_cap = make_capped_session(total_chunks=2, max_active_leases=1)
+    assert lease(s_cap["id"], 0).status_code == 200
+
+    # in_backoff：唯一分片失败冷却中
+    s_back = make_retry_session(total_chunks=1)
+    lease_fail_retry(s_back["id"], 0)
+
+    body = dispatch(
+        "q-reasons", [s_fin["id"], s_done["id"], s_cap["id"], s_back["id"]]
+    ).json()
+    assert body["granted"] is False
+    per = {u["session_id"]: u for u in body["unavailable"]}
+    assert per[s_fin["id"]]["reason"] == "finalized"
+    assert per[s_fin["id"]]["next_retry_at"] is None
+    assert per[s_done["id"]]["reason"] == "completed"
+    assert per[s_done["id"]]["next_retry_at"] is None
+    assert per[s_cap["id"]]["reason"] == "max_active_leases_reached"
+    assert per[s_cap["id"]]["next_retry_at"] is not None
+    assert per[s_back["id"]]["reason"] == "in_backoff"
+    assert per[s_back["id"]]["next_retry_at"] is not None
+    # 整体 next_retry_at = 各会话最早可重试时刻的最小值
+    assert body["next_retry_at"] == min(
+        per[s_cap["id"]]["next_retry_at"], per[s_back["id"]]["next_retry_at"]
+    )
+
+
+def test_dispatch_grants_lowest_claimable_chunk_reusing_lease_rules():
+    # 分片 0 冷却中：发放跳过冷却分片，领取最低可领取序号 1
+    s = make_retry_session(total_chunks=3)
+    lease_fail_retry(s["id"], 0)
+    r = dispatch("q-elig", [s["id"]]).json()
+    assert r["granted"] is True
+    assert r["chunk_index"] == 1
+
+    # 依赖未完成的会话被跳过，轮到下一个可用会话
+    s_dep = make_session_with_deps(2, {1: [0]})
+    lease(s_dep["id"], 0)  # 0 租出、1 被依赖阻塞：会话暂不可发放
+    s_ok = make_session(total_chunks=1)
+    r2 = dispatch("q-elig2", [s_dep["id"], s_ok["id"]]).json()
+    assert r2["granted"] is True
+    assert r2["session_id"] == s_ok["id"]
+    assert r2["chunk_index"] == 0
+
+
+def test_dispatch_respects_max_active_leases_when_granting():
+    s1 = make_capped_session(total_chunks=2, max_active_leases=1)
+    s2 = make_session(total_chunks=2)
+    r1 = dispatch("q-cap", [s1["id"], s2["id"]]).json()
+    assert (r1["session_id"], r1["chunk_index"]) == (s1["id"], 0)
+
+    # s1 并发槽位已满：即使游标轮到它也跳过，发给 s2
+    r2 = dispatch("q-cap", [s1["id"], s2["id"]]).json()
+    assert r2["session_id"] == s2["id"]
+
+    # s1 的租约过期后槽位释放，可再次发放（过期租约视为空闲）
+    expire_lease(s1["id"], 0)
+    r3 = dispatch("q-cap", [s1["id"], s2["id"]]).json()
+    assert r3["session_id"] == s1["id"]
+    assert r3["chunk_index"] == 0
+
+
+def test_dispatch_cursors_are_per_queue():
+    s1 = make_session(total_chunks=2)
+    s2 = make_session(total_chunks=1)
+    r1 = dispatch("q-a", [s1["id"], s2["id"]]).json()
+    assert (r1["session_id"], r1["chunk_index"]) == (s1["id"], 0)
+
+    # 另一个 queue_key 有独立游标：从头扫描，仍发到 s1（其 1 号分片空闲）
+    r2 = dispatch("q-b", [s1["id"], s2["id"]]).json()
+    assert (r2["session_id"], r2["chunk_index"]) == (s1["id"], 1)
+
+    # q-a 的游标在 s1 之后：轮到 s2
+    r3 = dispatch("q-a", [s1["id"], s2["id"]]).json()
+    assert (r3["session_id"], r3["chunk_index"]) == (s2["id"], 0)
+
+
+def test_dispatch_lease_ttl_default_and_override():
+    s = make_session(total_chunks=2)
+    before = datetime.now(timezone.utc)
+    r = dispatch("q-ttl", [s["id"]], ttl=120).json()
+    expires = datetime.fromisoformat(r["expires_at"])
+    assert 110 <= (expires - before).total_seconds() <= 130
+
+    r2 = dispatch("q-ttl", [s["id"]]).json()  # 缺省取服务端默认 300 秒
+    expires2 = datetime.fromisoformat(r2["expires_at"])
+    assert 290 <= (expires2 - before).total_seconds() <= 310
+
+
+def test_dispatch_concurrent_requests_never_double_grant():
+    s1 = make_session(total_chunks=3)
+    s2 = make_session(total_chunks=3)
+    barrier = threading.Barrier(6)
+    granted: list[tuple[str, int]] = []
+    results_lock = threading.Lock()
+
+    def worker():
+        barrier.wait()  # 尽量同时发起，迫使临界区串行化扫描/发放/游标推进
+        body = dispatch("q-race", [s1["id"], s2["id"]]).json()
+        if body["granted"]:
+            with results_lock:
+                granted.append((body["session_id"], body["chunk_index"]))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 6 个分片恰好全部发完：不重复发放、不遗漏
+    assert len(granted) == 6
+    assert len(set(granted)) == 6
+    assert client.get(f"/sessions/{s1['id']}").json()["active_leases"] == 3
+    assert client.get(f"/sessions/{s2['id']}").json()["active_leases"] == 3
+
+
+def test_dispatch_request_validation():
+    s = make_session()
+    assert client.post("/dispatch/lease", json={
+        "session_ids": [s["id"]]}).status_code == 422            # 缺 queue_key
+    assert client.post("/dispatch/lease", json={
+        "queue_key": "", "session_ids": [s["id"]]}).status_code == 422
+    assert client.post("/dispatch/lease", json={
+        "queue_key": "q", "session_ids": []}).status_code == 422
+    assert client.post("/dispatch/lease", json={
+        "queue_key": "q"}).status_code == 422                    # 缺 session_ids
+    assert client.post("/dispatch/lease", json={
+        "queue_key": "q", "session_ids": [s["id"]],
+        "lease_ttl_seconds": 0}).status_code == 422
+
+
+def test_migration_adds_dispatch_cursors_to_legacy_database(tmp_path):
+    import sqlite3
+
+    legacy = tmp_path / "legacy5.db"
+    conn = sqlite3.connect(legacy)
+    # 0006 之后、本次改动之前的旧 SCHEMA：无 dispatch_cursors 表
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, total_chunks INTEGER NOT NULL,
+            file_digest TEXT NOT NULL, digest_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            status TEXT NOT NULL DEFAULT 'active', max_active_leases INTEGER,
+            base_retry_seconds INTEGER NOT NULL DEFAULT 5,
+            max_retry_seconds INTEGER NOT NULL DEFAULT 300,
+            revision INTEGER NOT NULL DEFAULT 0, source_session_id TEXT,
+            created_at TEXT NOT NULL, finalized_at TEXT
+        );
+        CREATE TABLE chunks (
+            session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', lease_token TEXT,
+            lease_expires_at TEXT, chunk_digest TEXT, completed_at TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT,
+            PRIMARY KEY (session_id, chunk_index)
+        );
+        CREATE TABLE chunk_dependencies (
+            session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (session_id, chunk_index, depends_on)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    import app.db as db
+
+    migrated = sqlite3.connect(legacy)
+    db.run_migrations(migrated)
+    tables = {r[0] for r in migrated.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+    assert "dispatch_cursors" in tables
+    db.run_migrations(migrated)  # 再次执行幂等不报错
+    migrated.close()

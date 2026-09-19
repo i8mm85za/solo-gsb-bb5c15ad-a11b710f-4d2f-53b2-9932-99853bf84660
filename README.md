@@ -48,6 +48,7 @@ docker compose up --build
 - **进度分支（fork）**：`POST /sessions/{id}/fork` 从一个 **`active`** 会话分叉出全新的上传会话，请求体包含 `expected_revision`（调用方认为源会话所处的修订号，不匹配返回 `409` 及 `current_revision`）、幂等键 `request_id` 与 `reuse_chunks`（要复用进度的分片序号列表，可为空）。仅当 `reuse_chunks` 中**每一项都已在源会话完成**（越界序号按未完成处理，响应以 `not_completed_chunks` 返回），且集合**包含这些分片的全部传递前置分片**（缺失项以 `missing_prerequisites` 升序返回）时才会创建；任一校验失败返回 `409` 且**不落库**。新会话复制源会话的**全部配置**（总分片数、文件摘要、摘要算法、并发上限、退避参数）与**完整依赖图**：复用分片的**摘要与完成时间**复制为 `completed`，其余分片初始化为 `pending`；**不复制**租约（令牌/过期时间）、退避冷却与累计失败次数。新会话 `revision` 从 0 开始、状态为 `active`，与源会话相互独立。**同一源会话 + 同一 `request_id` 的重放**（含仅顺序/重复不同的 `reuse_chunks`）返回**首次创建的新会话**（`200`、`idempotent_replay: true`）；相同键但 `expected_revision` 或 `reuse_chunks` 变化返回 `409`。已提交（`finalized`）的会话不可再分支。
 - **会话级并发上限（可选）**：创建会话时可设置 `max_active_leases`，限制该会话**当前有效（未过期）租约**的总数。单片领取在槽位占满时返回 `409`；批量领取则原子地领取至多 `min(count, 剩余槽位, 可领取分片数)` 个租约。不设置（`null`）时保持原有不限并发的行为。
 - **批量领取**：`POST /sessions/{id}/leases/batch` 在**同一临界区**内完成资格计算与写入：仅从“未完成、无有效租约（过期租约视为空闲）、**不在退避冷却中**、前置已全部完成”的分片中，按分片序号升序领取，返回各分片独立令牌；并发请求之间不会重复分配、也不会突破并发上限。无可领取项时返回空列表及 `active` / `blocked` / `next_expiry` 汇总，其中 **`next_expiry` 取有效租约最早过期时间与各分片退避最早结束时间中的更早者**。
+- **跨会话公平调度**：`POST /dispatch/lease` 携带 `queue_key`、候选 `session_ids` 与可选 `lease_ttl_seconds`。候选会话**去重后按（创建时间, id）稳定排序**（未知会话按 id 排在最后），服务端按 `queue_key` 持久化**最近一次成功会话**作为游标，在**同一写锁事务**内从游标之后**循环扫描**，向首个可用会话发放其**最低序号可领取分片**——资格判断复用批量领取的全部规则（依赖、退避、有效租约、`max_active_leases`），并发请求不会重复发放。**无可发放项时不推进游标**，返回各会话的不可用原因（`not_found` / `finalized` / `completed` / `max_active_leases_reached` / `leases_active` / `in_backoff` / `blocked_by_dependencies`）与最早的 `next_retry_at`；**成功后才更新游标**，连续请求因此在可用会话间轮转。
 - **提交**：仅当全部分片完成才允许提交，返回按分片序号升序汇总的清单；否则返回 `409` 及 `missing_chunks` 缺失分片列表。重复提交幂等返回同一清单。会话使用 `sha256-merkle-v1` 时，提交前先按分片序号构建 Merkle 树并与 `file_digest` 常量时间比较，不匹配返回 `409` 及 `computed_digest`，会话保持 `active`（见下文「完整性校验」）。
 - 已完成的分片不可再领取租约；已提交的会话进入只读状态。
 
@@ -123,6 +124,7 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 | `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片、被依赖阻塞的分片，以及退避冷却中的分片（`cooling_chunks`） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/lease` | 领取分片租约（同样受 `max_active_leases` 与退避冷却约束） |
 | `POST` | `/sessions/{session_id}/leases/batch` | 原子批量领取租约（按分片序号，数量不超过 `count` 与剩余并发槽位；自动跳过冷却分片） |
+| `POST` | `/dispatch/lease` | 跨会话公平调度：按 `queue_key` 轮转游标，从首个可用会话领取最低序号分片；无可发放项时返回各会话原因与最早 `next_retry_at` |
 | `POST` | `/sessions/{session_id}/chunks/{index}/complete` | 上报分片完成（幂等；清除退避、保留失败次数） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/reopen` | 完成纠错回退（凭完成时的令牌与摘要，原子重置目标及全部传递下游，`revision` 递增 1） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/fail` | 上报分片失败（校验有效租约，原子清除租约并进入指数退避） |
@@ -366,6 +368,52 @@ curl -s -X POST http://localhost:8000/sessions/$SID/fork \
 curl -s http://localhost:8000/sessions/<新会话id>
 # => {"source_session_id": "<源会话id>", "revision": 0, ...}
 ```
+
+## 跨会话公平调度（curl）
+
+多个上传会话组成一个逻辑队列，调用方只关心「给我下一个可做的分片」：服务端按
+`queue_key` 维护轮转游标，每次从游标之后的首个可用会话发放其最低序号可领取分片，
+连续请求在可用会话间公平轮转；某会话临时不可用（租约占满、退避冷却、并发槽位满）
+时会被自动跳过，恢复后重新参与轮转。
+
+```bash
+# 1. 准备两个上传会话（略：POST /sessions 创建，记为 SID_A、SID_B）
+
+# 2. 同一 queue_key 连续领取：第一次在 SID_A，第二次轮转到 SID_B，第三次回到 SID_A
+curl -s -X POST http://localhost:8000/dispatch/lease \
+  -H 'Content-Type: application/json' \
+  -d "{\"queue_key\": \"ingest-2026-09\", \"session_ids\": [\"$SID_A\", \"$SID_B\"],
+       \"lease_ttl_seconds\": 120}"
+# => {"queue_key": "ingest-2026-09", "granted": true,
+#     "session_id": "<SID_A>", "chunk_index": 0,
+#     "lease_token": "...", "expires_at": "2026-...",
+#     "unavailable": [], "next_retry_at": null}
+
+# 3. 拿到的是普通分片租约：完成/失败上报沿用既有接口，令牌完全通用
+curl -s -X POST http://localhost:8000/sessions/$SID_A/chunks/0/complete \
+  -H 'Content-Type: application/json' \
+  -d "{\"lease_token\": \"$TOKEN\", \"chunk_digest\": \"<分片0的SHA256>\"}"
+
+# 4. 所有候选会话都不可发放时：granted=false，逐会话给出原因，
+#    next_retry_at 为各会话最早可重试时刻的最小值；游标不推进
+curl -s -X POST http://localhost:8000/dispatch/lease \
+  -H 'Content-Type: application/json' \
+  -d "{\"queue_key\": \"ingest-2026-09\", \"session_ids\": [\"$SID_A\", \"$SID_B\"]}"
+# => {"queue_key": "ingest-2026-09", "granted": false,
+#     "session_id": null, "chunk_index": null, "lease_token": null, "expires_at": null,
+#     "unavailable": [
+#       {"session_id": "<SID_A>", "reason": "leases_active",
+#        "next_retry_at": "2026-..."},
+#       {"session_id": "<SID_B>", "reason": "in_backoff",
+#        "next_retry_at": "2026-..."}
+#     ],
+#     "next_retry_at": "2026-..."}
+```
+
+候选列表**去重后按（创建时间, id）稳定排序**，与请求中的顺序无关；未知会话 id
+按 id 排在最后并以 `not_found` 归因。游标只在成功发放时推进；不同 `queue_key`
+的游标相互独立。发放的租约与单片/批量领取的租约完全等价：占用会话
+`max_active_leases` 槽位，过期后可被重新领取。
 
 ## 本地开发（不用 Docker）
 

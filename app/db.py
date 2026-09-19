@@ -65,6 +65,14 @@ CREATE TABLE IF NOT EXISTS chunk_dependencies (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunk_deps_session ON chunk_dependencies(session_id);
+
+-- 跨会话公平调度游标：按 queue_key 持久化最近一次成功发放的会话 id，
+-- 下次领取从该会话之后循环扫描；仅在成功发放时推进
+CREATE TABLE IF NOT EXISTS dispatch_cursors (
+    queue_key        TEXT PRIMARY KEY,
+    last_session_id  TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
 """
 
 # 增量迁移：针对早于当前 SCHEMA 创建的旧库，幂等执行（CREATE TABLE IF NOT EXISTS
@@ -125,6 +133,18 @@ CREATE TABLE fork_requests (
     reuse_chunks       TEXT NOT NULL,
     created_at         TEXT NOT NULL,
     PRIMARY KEY (source_session_id, request_id)
+)
+        """,
+    ),
+    # 0007: 跨会话公平调度游标表；旧库直接按当前定义新建
+    (
+        "table",
+        "dispatch_cursors",
+        """
+CREATE TABLE dispatch_cursors (
+    queue_key        TEXT PRIMARY KEY,
+    last_session_id  TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
 )
         """,
     ),

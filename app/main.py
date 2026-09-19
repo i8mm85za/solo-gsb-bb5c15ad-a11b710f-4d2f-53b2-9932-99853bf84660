@@ -23,6 +23,12 @@
 - 状态查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间，以及会话 revision
   与 source_session_id）
 - 就绪查询：当前可领取的分片、被依赖阻塞的分片以及退避冷却中的分片
+- 跨会话公平调度：POST /dispatch/lease 携带 queue_key、候选 session_ids 与
+  lease_ttl_seconds；候选去重后按（创建时间, id）稳定排序，服务端按 queue_key 持久化
+  最近一次成功会话作为游标，在同一写锁事务内从游标之后循环扫描，从首个可用会话领取
+  最低序号可领取分片（资格判断复用依赖、退避、有效租约与 max_active_leases 规则，
+  并发请求不重复发放）；无可发放项时不推进游标，返回各会话不可用原因与最早
+  next_retry_at；成功后才更新游标，使连续请求在可用会话间轮转
 """
 from __future__ import annotations
 
@@ -51,6 +57,9 @@ from .schemas import (
     CompleteResponse,
     CoolingChunk,
     CreateSessionRequest,
+    DispatchLeaseRequest,
+    DispatchLeaseResponse,
+    DispatchUnavailableSession,
     FailRequest,
     FailResponse,
     FinalizeResponse,
@@ -786,6 +795,149 @@ def claim_leases_batch(session_id: str, req: BatchLeaseRequest):
         remaining_slots=(
             None if max_active is None else max(0, max_active - active_after)
         ),
+    )
+
+
+# ---------------------------------------------------------------- 跨会话公平调度
+
+def dispatch_unavailability(session, now: datetime) -> tuple[str, Optional[datetime]]:
+    """临界区内调用：会话当前不可发放租约时的归因与最早可重试时刻。
+
+    前提：claimable_chunks 已判定该会话没有可领取分片，或并发槽位已满。
+    最早可重试时刻复用 earliest_wakeup：有效租约最早过期时间与各分片退避
+    最早结束时间中更早者。
+    """
+    sid = session["id"]
+    next_retry = earliest_wakeup(sid, now)
+    max_active = session["max_active_leases"]
+    if max_active is not None and count_active_leases(sid, now) >= max_active:
+        return "max_active_leases_reached", next_retry
+    rows = get_conn().execute(
+        "SELECT * FROM chunks WHERE session_id = ? AND status != 'completed'"
+        " ORDER BY chunk_index",
+        (sid,),
+    ).fetchall()
+    if not rows:
+        return "completed", None  # 分片全部完成、等待提交：无时间性等待事件
+    if any(lease_valid(r, now) for r in rows):
+        return "leases_active", next_retry
+    if any(backoff_active(r, now) for r in rows):
+        return "in_backoff", next_retry
+    # 剩余情形：全部未完成分片均被依赖阻塞。依赖图无环且无任何在途租约/冷却时
+    # 必然存在可领取分片，正常不会到达；保留该原因以保证响应始终可解释
+    return "blocked_by_dependencies", next_retry
+
+
+@app.post(
+    "/dispatch/lease",
+    response_model=DispatchLeaseResponse,
+    tags=["dispatch"],
+    summary="跨会话公平调度：按 queue_key 轮转，从首个可用会话领取最低序号分片",
+)
+def dispatch_lease(req: DispatchLeaseRequest):
+    """候选会话去重后按（创建时间, id）稳定排序（未知会话按 id 排在最后）；从
+    queue_key 游标（最近一次成功会话）之后循环扫描，向首个可用会话发放其最低序号
+    可领取分片。资格判断复用批量领取的全部规则（依赖、退避、有效租约、
+    max_active_leases）；扫描、发放与游标推进在同一 DB_LOCK 临界区内完成，并发请求
+    不会重复发放。无可发放项时不推进游标，返回各会话不可用原因与最早
+    next_retry_at；成功后才更新游标，使连续请求在可用会话间轮转。"""
+    ttl = DEFAULT_LEASE_TTL_SECONDS
+    if req.lease_ttl_seconds is not None:
+        ttl = min(req.lease_ttl_seconds, MAX_LEASE_TTL_SECONDS)
+
+    now = utcnow()
+    with DB_LOCK:
+        conn = get_conn()
+        # 去重后按（创建时间, id）稳定排序；未知会话没有创建时间，按 id 排在最后
+        unique_ids = list(dict.fromkeys(req.session_ids))
+        rows = conn.execute(
+            f"SELECT * FROM sessions WHERE id IN ({','.join('?' * len(unique_ids))})",
+            unique_ids,
+        ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        known = sorted(by_id.values(), key=lambda r: (parse_ts(r["created_at"]), r["id"]))
+        ordered = [r["id"] for r in known] + sorted(
+            sid for sid in unique_ids if sid not in by_id
+        )
+
+        # 逐会话资格评估：复用批量领取的 claimable_chunks / count_active_leases 规则
+        grantable: dict[str, int] = {}  # session_id -> 最低可领取分片序号
+        reasons: dict[str, tuple[str, Optional[datetime]]] = {}
+        for sid in ordered:
+            session = by_id.get(sid)
+            if session is None:
+                reasons[sid] = ("not_found", None)
+                continue
+            if session["status"] == "finalized":
+                reasons[sid] = ("finalized", None)
+                continue
+            ready, _ = claimable_chunks(sid, now)
+            max_active = session["max_active_leases"]
+            if ready and (max_active is None
+                          or count_active_leases(sid, now) < max_active):
+                grantable[sid] = ready[0]
+            else:
+                reasons[sid] = dispatch_unavailability(session, now)
+
+        # 从游标（最近一次成功会话）之后循环扫描；无游标或游标不在候选中时从头开始
+        cursor = conn.execute(
+            "SELECT last_session_id FROM dispatch_cursors WHERE queue_key = ?",
+            (req.queue_key,),
+        ).fetchone()
+        start = 0
+        if cursor is not None and cursor["last_session_id"] in ordered:
+            start = (ordered.index(cursor["last_session_id"]) + 1) % len(ordered)
+        granted_sid = None
+        for i in range(len(ordered)):
+            sid = ordered[(start + i) % len(ordered)]
+            if sid in grantable:
+                granted_sid = sid
+                break
+
+        if granted_sid is not None:
+            chunk_index = grantable[granted_sid]
+            token = secrets.token_urlsafe(32)
+            expires_at = now + timedelta(seconds=ttl)
+            conn.execute(
+                "UPDATE chunks SET status = 'leased', lease_token = ?, lease_expires_at = ?"
+                " WHERE session_id = ? AND chunk_index = ?",
+                (token, expires_at.isoformat(), granted_sid, chunk_index),
+            )
+            # 成功后才推进游标：连续请求在可用会话间轮转
+            conn.execute(
+                "INSERT INTO dispatch_cursors (queue_key, last_session_id, updated_at)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(queue_key) DO UPDATE SET"
+                " last_session_id = excluded.last_session_id,"
+                " updated_at = excluded.updated_at",
+                (req.queue_key, granted_sid, now.isoformat()),
+            )
+            conn.commit()
+            return DispatchLeaseResponse(
+                queue_key=req.queue_key,
+                granted=True,
+                session_id=granted_sid,
+                chunk_index=chunk_index,
+                lease_token=token,
+                expires_at=expires_at,
+            )
+
+        # 无可发放项：不推进游标，按稳定排序返回各会话原因与最早可重试时刻
+        unavailable = [
+            DispatchUnavailableSession(
+                session_id=sid,
+                reason=reasons[sid][0],
+                next_retry_at=reasons[sid][1],
+            )
+            for sid in ordered
+        ]
+        retries = [u.next_retry_at for u in unavailable if u.next_retry_at is not None]
+
+    return DispatchLeaseResponse(
+        queue_key=req.queue_key,
+        granted=False,
+        unavailable=unavailable,
+        next_retry_at=min(retries) if retries else None,
     )
 
 

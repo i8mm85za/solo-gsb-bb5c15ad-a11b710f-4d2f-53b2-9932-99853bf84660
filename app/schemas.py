@@ -353,3 +353,49 @@ class SessionStatusResponse(BaseModel):
     created_at: datetime
     finalized_at: Optional[datetime] = None
     chunks: list[ChunkStatus]
+
+
+class DispatchLeaseRequest(BaseModel):
+    queue_key: str = Field(
+        min_length=1, max_length=128,
+        description="调度队列键：同一 queue_key 共享一个轮转游标（最近一次成功发放的会话）")
+    session_ids: list[str] = Field(
+        min_length=1, max_length=1000,
+        description="候选会话 id 列表；服务端去重后按（创建时间, id）稳定排序，"
+                    "未知会话按 id 排在最后并以 not_found 归因")
+    lease_ttl_seconds: Optional[int] = Field(
+        default=None, ge=1,
+        description="租约有效期（秒），缺省取服务端默认值，超过服务端上限会被截断")
+
+
+class DispatchUnavailableSession(BaseModel):
+    session_id: str
+    reason: str = Field(
+        description="不可用原因：not_found（会话不存在）| finalized（会话已提交）| "
+                    "completed（分片全部完成、待提交）| max_active_leases_reached（并发槽位占满）| "
+                    "leases_active（存在有效租约）| in_backoff（失败退避冷却中）| "
+                    "blocked_by_dependencies（被依赖阻塞）")
+    next_retry_at: Optional[datetime] = Field(
+        default=None,
+        description="该会话最早可能恢复可领取的时刻：有效租约最早过期时间与退避最早结束"
+                    "时间中更早者；无时间性等待事件时为 null")
+
+
+class DispatchLeaseResponse(BaseModel):
+    queue_key: str
+    granted: bool = Field(description="本次是否成功发放租约")
+    session_id: Optional[str] = Field(
+        default=None, description="granted=true 时：被发放的会话 id")
+    chunk_index: Optional[int] = Field(
+        default=None, description="granted=true 时：该会话当前可领取的最低序号分片")
+    lease_token: Optional[str] = Field(
+        default=None, description="granted=true 时：租约令牌")
+    expires_at: Optional[datetime] = Field(
+        default=None, description="granted=true 时：租约过期时间")
+    unavailable: list[DispatchUnavailableSession] = Field(
+        default_factory=list,
+        description="granted=false 时：各候选会话（按稳定排序）的不可用原因")
+    next_retry_at: Optional[datetime] = Field(
+        default=None,
+        description="granted=false 时：各会话 next_retry_at 中的最早者；"
+                    "均无可等待事件时为 null")
